@@ -1,0 +1,165 @@
+# GitLab CI/CD - Build and push Docker image to GitLab Container Registry
+# คู่มือการใช้งาน:
+# - GitLab จะให้ตัวแปรอัตโนมัติ: CI_REGISTRY, CI_REGISTRY_IMAGE, CI_REGISTRY_USER, CI_REGISTRY_PASSWORD (CI_JOB_TOKEN)
+# - สำหรับ Dokploy: ให้ตั้งค่า Project → Settings → CI/CD → Variables:
+#     - DOKPLOY_WEBHOOK_URL        (ค่า URL ของ production webhook)
+#     - DOKPLOY_TOKEN              (ตั้งเป็น Masked = true และ Protected = true)
+#     - DOKPLOY_WEBHOOK_URL_DEV    (ค่า URL ของ dev webhook)
+#     - DOKPLOY_TOKEN_DEV          (Masked, ใช้สำหรับ dev หากต้องการ)
+#   ทั้งสองตัวแปรควรตั้งค่าเป็น Masked และ DOKPLOY_TOKEN ควรเป็น Protected หากต้องการให้ trigger เฉพาะ branch ที่ป้องกัน
+# - หมายเหตุ: job สำหรับ publish (docker_build) ถูกตั้งให้รันเฉพาะ branch main/dev เพื่อ push tag แยกกัน (latest / latest-dev)
+#
+variables:
+  DOCKER_DRIVER: overlay2
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  LATEST_TAG: $CI_REGISTRY_IMAGE:latest
+  DEV_LATEST_TAG: $CI_REGISTRY_IMAGE:latest-dev
+  # Default Dokploy webhook (override in Project → Settings → CI/CD → Variables if needed)
+  # NOTE: set DOKPLOY_TOKEN & DOKPLOY_TOKEN_DEV in GitLab CI/CD variables (masked) for secure usage
+
+stages:
+  - build
+  - publish
+  - deploy
+
+# Build: ติดตั้ง dependencies และ build แอป (เก็บ artifacts)
+build:
+  stage: build
+  image: golang:1.25-alpine
+  script:
+    - go version
+    - go build -o order-v2-microservice ./cmd/main.go
+  artifacts:
+    paths:
+      - order-v2-microservice
+    expire_in: 1 hour
+  rules:
+    # 1) สร้าง build เมื่อเป็น Merge Request (ตรวจสอบว่า build ผ่านก่อน merge)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    # 2) สร้าง build เมื่อเป็น push ไปยัง main หรือ dev (ให้ pipeline เต็มทำงานต่อ: docker_build → trigger_dokploy)
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_REF_NAME == "main" || $CI_COMMIT_REF_NAME == "dev")'
+      when: on_success
+    # ป้องกันไม่ให้ job นี้รันในกรณีอื่น
+    - when: never
+
+# Test (optional)
+#test:
+#  stage: test
+#  image: node:18-alpine
+#  cache:
+#    paths:
+#      - .pnpm-store/
+#      - node_modules/
+#  script:
+#    - corepack enable
+#    - corepack prepare pnpm@latest --activate
+#    - pnpm install --frozen-lockfile
+#    - pnpm test
+#  when: on_success
+
+# Build and push Docker image to GitLab Container Registry
+docker_build:
+  stage: publish
+  # Use matching Docker CLI and dind versions to avoid API-version mismatch
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_TLS_CERTDIR: ""
+  needs:
+    - job: build
+      artifacts: true
+  before_script:
+    - echo "Logging in to GitLab Container Registry"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - which git || (apk add --no-cache git || (apt-get update && apt-get install -y git) || true)
+  script:
+    - docker build -t "$IMAGE_TAG" .
+    - docker push "$IMAGE_TAG"
+    - |
+      if [ "$CI_COMMIT_REF_NAME" = "main" ] || [ "$CI_COMMIT_REF_NAME" = "master" ]; then
+        echo "Pushing production latest tag"
+        docker tag "$IMAGE_TAG" "$LATEST_TAG"
+        docker push "$LATEST_TAG"
+      elif [ "$CI_COMMIT_REF_NAME" = "dev" ]; then
+        echo "Pushing dev latest-dev tag"
+        docker tag "$IMAGE_TAG" "$DEV_LATEST_TAG"
+        docker push "$DEV_LATEST_TAG"
+      else
+        echo "Branch $CI_COMMIT_REF_NAME: no additional tagging"
+      fi
+  rules:
+    # ห้ามรันบน Merge Request ทุกกรณี
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    # รันเฉพาะ push ไป main/dev
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "dev"'
+      when: on_success
+    - when: never
+
+trigger_dokploy:
+  stage: deploy
+  image: curlimages/curl:8.2.1
+  needs:
+    - job: docker_build
+      artifacts: false
+  script:
+    - |
+      echo "Trigger stage: preparing payload and calling Dokploy (auth type=${DOKPLOY_AUTH_TYPE:-none})"
+      # select webhook + token based on branch; fallback to generic webhook/token if env-specific not set
+      if [ "$CI_COMMIT_REF_NAME" = "dev" ]; then
+        WEBHOOK_URL="${DOKPLOY_WEBHOOK_URL_DEV:-}"
+        DOKPLOY_TOKEN_CURRENT="${DOKPLOY_TOKEN_DEV:-}"
+        echo "Using webhook: ${WEBHOOK_URL:+set} ${WEBHOOK_URL:+(dev)}"
+      else
+        WEBHOOK_URL="${DOKPLOY_WEBHOOK_URL:-}"
+        DOKPLOY_TOKEN_CURRENT="${DOKPLOY_TOKEN:-}"
+        echo "Using webhook: ${WEBHOOK_URL:+set} ${WEBHOOK_URL:+(prod)}"
+      fi
+      if [ -z "$WEBHOOK_URL" ]; then
+        echo "Dokploy webhook for branch '$CI_COMMIT_REF_NAME' not set; skipping dokploy trigger"
+        exit 0
+      fi
+      PAYLOAD="{\"image\":\"$IMAGE_TAG\",\"ref\":\"$CI_COMMIT_REF_NAME\",\"registry\":\"$CI_REGISTRY\"}"
+      case "${DOKPLOY_AUTH_TYPE:-none}" in
+        "x-gitlab-token")
+          if [ -n "$DOKPLOY_TOKEN_CURRENT" ]; then
+            curl -sS -X POST -H "X-Gitlab-Token: $DOKPLOY_TOKEN_CURRENT" -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" || echo "Dokploy trigger failed but continuing..."
+          else
+            echo "DOKPLOY_TOKEN for this environment not set; attempting unsigned request"
+            curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" || echo "Dokploy trigger failed but continuing..."
+          fi
+          ;;
+        "basic")
+          # For basic auth, you can also set env-specific user/password if needed
+          if [ -n "$DOKPLOY_BASIC_USER" ] && [ -n "$DOKPLOY_BASIC_PASSWORD" ]; then
+            curl -sS -X POST -u "$DOKPLOY_BASIC_USER:$DOKPLOY_BASIC_PASSWORD" -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" || echo "Dokploy trigger failed but continuing..."
+          else
+            echo "DOKPLOY_BASIC_USER or DOKPLOY_BASIC_PASSWORD not set; skipping Dokploy trigger"
+          fi
+          ;;
+        *)
+          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" || echo "Dokploy trigger failed but continuing..."
+          ;;
+      esac
+  rules:
+    # ห้ามรันบน Merge Request ทุกกรณี
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    # รันเฉพาะ push ไป main/dev
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "dev"'
+      when: on_success
+    - when: never
+
+# ตัวอย่างการตั้งค่า Variables:
+# - CI_REGISTRY (โดย GitLab กำหนดให้อัตโนมัติ)
+# - CI_REGISTRY_USER (โดย GitLab กำหนดให้อัตโนมัติ)
+# - CI_REGISTRY_PASSWORD (โดย GitLab กำหนดให้อัตโนมัติ)
+# - เพิ่ม: DOKPLOY_WEBHOOK_URL_DEV, DOKPLOY_TOKEN_DEV (สำหรับ dev) หากต้องการแยก webhook/credentials
+# หากต้องการ push เมื่อเป็น branch เฉพาะ ให้ปรับ 'rules'

@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+main
+
+# Test files
+*_test.go
+*.test
+coverage.txt
+
+# CI/CD
+.gitlab-ci.yml
+.gitlab/
+.circleci/
+.travis.yml
+Jenkinsfile
+
+# Development tools
+.air.toml
+air.conf
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Environment files (should be passed at runtime)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
