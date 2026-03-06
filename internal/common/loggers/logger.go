@@ -5,9 +5,17 @@ import (
 	"fmt"
 	"log"
 	"order-v2-microservice/internal/models"
+	"os"
 	"time"
 
 	"github.com/labstack/echo/v5"
+)
+
+const (
+	colorReset  = "\033[0m"
+	colorGreen  = "\033[32m"
+	colorRed    = "\033[31m"
+	colorYellow = "\033[33m"
 )
 
 type Logger struct {
@@ -26,8 +34,7 @@ func (rl *Logger) Info(c *echo.Context, message ...interface{}) {
 		Message:     fmt.Sprint(message...),
 	}
 
-	logMessage := loggingToJson(logging)
-	log.Println(logMessage)
+	fmt.Print(formatLog(logging))
 }
 
 func (rl *Logger) Error(c *echo.Context, message ...interface{}) {
@@ -42,8 +49,33 @@ func (rl *Logger) Error(c *echo.Context, message ...interface{}) {
 		Message:     fmt.Sprint(message...),
 	}
 
-	logMessage := loggingToJson(logging)
-	log.Println(logMessage)
+	fmt.Print(formatLog(logging))
+}
+
+func formatLog(logging models.CommonLog) string {
+	pid := os.Getpid()
+	timestamp := logging.TimeStamp.Format("01/02/2006, 3:04:05 PM")
+
+	var levelColor, levelStr string
+	switch logging.LogLevel {
+	case "Error":
+		levelColor = colorRed
+		levelStr = "ERROR"
+	default:
+		levelColor = colorGreen
+		levelStr = "LOG  "
+	}
+
+	return fmt.Sprintf(
+		"%s[AkiiraTech-Logger]%s %d  - %s     %s%s%s %s[%s]%s %s (req_id: %s)\n",
+		colorYellow, colorReset,
+		pid,
+		timestamp,
+		levelColor, levelStr, colorReset,
+		colorYellow, logging.Service, colorReset,
+		logging.Message,
+		logging.RequestId,
+	)
 }
 
 func loggingToJson(logging models.CommonLog) string {
